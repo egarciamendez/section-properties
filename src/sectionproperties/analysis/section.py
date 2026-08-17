@@ -40,6 +40,38 @@ if TYPE_CHECKING:
     from rich.progress import Progress, TaskID
 
 
+def lagrange_matrix(
+    k: csc_matrix,
+    c: npt.NDArray[np.float64],
+) -> csc_matrix:
+    r"""Extends a stiffness matrix with a Lagrangian multiplier row and column.
+
+    The extended matrix imposes :math:`c \cdot u = 0` on the solution of
+    :math:`Ku = f`, which removes the constant that the singular warping
+    stiffness matrix leaves free.
+
+    Args:
+        k: ``N x N`` stiffness matrix
+        c: ``N`` constraint vector
+
+    Returns:
+        The ``(N+1) x (N+1)`` Lagrangian multiplier matrix
+    """
+    n_size = k.shape[0]
+    k_coo = k.tocoo()
+
+    lagrange = np.arange(n_size)
+    row = np.concatenate((k_coo.row, lagrange, np.full(n_size, n_size)))
+    col = np.concatenate((k_coo.col, np.full(n_size, n_size), lagrange))
+    data = np.concatenate((k_coo.data, c, c))
+
+    k_lg = coo_matrix(
+        (data, (row, col)), shape=(n_size + 1, n_size + 1), dtype=float
+    )
+
+    return csc_matrix(k_lg, dtype=float)
+
+
 class Section:
     """Class for structural cross-sections.
 
@@ -536,16 +568,15 @@ class Section:
                     description=msg,
                     total=self.num_elements,
                 )
-                k_lg, f_torsion = self.assemble_torsion(
-                    progress=progress, task=task, batch=batch
-                )
+                k, c_torsion, f_torsion = self.assemble_warping(batch=batch)
+                progress.update(task_id=task, advance=self.num_elements)
 
                 msg = f"[green]:white_check_mark: {self.num_nodes}x{self.num_nodes} "
                 msg += "stiffness matrix assembled"
                 progress.update(task_id=task, description=msg)
                 progress.update(cast("TaskID", 0), advance=1)
             else:
-                k_lg, f_torsion = self.assemble_torsion(batch=batch)
+                k, c_torsion, f_torsion = self.assemble_warping(batch=batch)
 
             # section properties the shear function load vectors depend on
             if self.is_composite():
@@ -594,6 +625,15 @@ class Section:
             else:
                 f_psi, f_phi = assemble_shear_load()
 
+            if solver_type not in ("cgs", "direct"):
+                msg = "solver_type must be 'cgs' or 'direct'."
+                raise ValueError(msg)
+
+            # the cgs method works on the Lagrangian multiplier matrix
+            k_lg = (
+                lagrange_matrix(k=k, c=c_torsion) if solver_type == "cgs" else None
+            )
+
             # ILU decomposition of stiffness matrices
             def ilu_decomp(
                 progress: Progress | None = None,
@@ -633,22 +673,20 @@ class Section:
                 npt.NDArray[np.float64],
                 npt.NDArray[np.float64],
             ]:
-                if solver_type == "cgs" and k_lg_precond:
+                if solver_type == "cgs" and k_lg_precond is not None:
                     return (
                         solver.solve_cgs_lagrange(k_lg=k_lg, f=f_torsion, m=k_lg_precond),
                         solver.solve_cgs_lagrange(k_lg=k_lg, f=f_psi, m=k_lg_precond),
                         solver.solve_cgs_lagrange(k_lg=k_lg, f=f_phi, m=k_lg_precond),
                     )
 
-                if solver_type == "direct":
-                    solution = solver.solve_direct_lagrange_multi(
-                        k_lg=k_lg,
-                        f=np.column_stack((f_torsion, f_psi, f_phi)),
-                    )
-                    return solution[:, 0], solution[:, 1], solution[:, 2]
+                solution = solver.solve_warping_direct(
+                    k=k,
+                    c=c_torsion,
+                    f=np.column_stack((f_torsion, f_psi, f_phi)),
+                )
 
-                msg = "solver_type must be 'cgs' or 'direct'."
-                raise ValueError(msg)
+                return solution[:, 0], solution[:, 1], solution[:, 2]
 
             if progress:
                 msg = f"[red]Solving warping and shear functions ({solver_type})"
@@ -1037,16 +1075,24 @@ class Section:
                     description=msg,
                     total=self.num_elements,
                 )
-                k_lg, f_torsion = self.assemble_torsion(
-                    progress=progress, task=task, batch=batch
-                )
+                k, c_torsion, f_torsion = self.assemble_warping(batch=batch)
+                progress.update(task_id=task, advance=self.num_elements)
 
                 msg = f"[green]:white_check_mark: {self.num_nodes}x{self.num_nodes} "
                 msg += "stiffness matrix assembled"
                 progress.update(task_id=task, description=msg)
                 progress.update(cast("TaskID", 0), advance=1)
             else:
-                k_lg, f_torsion = self.assemble_torsion(batch=batch)
+                k, c_torsion, f_torsion = self.assemble_warping(batch=batch)
+
+            if solver_type not in ("cgs", "direct"):
+                msg = "solver_type must be 'cgs' or 'direct'."
+                raise ValueError(msg)
+
+            # the cgs method works on the Lagrangian multiplier matrix
+            k_lg = (
+                lagrange_matrix(k=k, c=c_torsion) if solver_type == "cgs" else None
+            )
 
             # ILU decomposition of stiffness matrices
             def ilu_decomp(
@@ -1081,17 +1127,14 @@ class Section:
 
             # solve for warping function
             def solve_warping() -> npt.NDArray[np.float64]:
-                if solver_type == "cgs" and k_lg_precond:
-                    omega = solver.solve_cgs_lagrange(
+                if solver_type == "cgs" and k_lg_precond is not None:
+                    return solver.solve_cgs_lagrange(
                         k_lg=k_lg, f=f_torsion, m=k_lg_precond
                     )
-                elif solver_type == "direct":
-                    omega = solver.solve_direct_lagrange(k_lg=k_lg, f=f_torsion)
-                else:
-                    msg = "solver_type must be 'cgs' or 'direct'."
-                    raise ValueError(msg)
 
-                return omega
+                return solver.solve_warping_direct(
+                    k=k, c=c_torsion, f=f_torsion[:, None]
+                )[:, 0]
 
             if progress:
                 msg = f"[red]Solving warping function ({solver_type})"
@@ -1510,6 +1553,34 @@ class Section:
             Lagrangian multiplier stiffness matrix and torsion load vector (``k_lg``,
             ``f_torsion``)
         """
+        k, c_torsion, f_torsion = self.assemble_warping(batch=batch)
+
+        if progress and task:
+            progress.update(task_id=task, advance=self.num_elements)
+
+        return lagrange_matrix(k=k, c=c_torsion), f_torsion
+
+    def assemble_warping(
+        self,
+        batch: sp_batch.ElementBatch | None = None,
+    ) -> tuple[csc_matrix, npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+        r"""Assembles the warping stiffness matrix without the Lagrangian multiplier.
+
+        The stiffness matrix returned here is singular: adding a constant to a
+        warping or shear function leaves the equations unchanged. The constraint
+        vector ``c_torsion`` removes that freedom through
+        :math:`c \cdot \omega = 0`, which :func:`assemble_torsion` expresses as an
+        extra row and column and :func:`~sectionproperties.analysis.solver.solve_warping_direct`
+        applies directly.
+
+        Args:
+            batch: Shape function data to assemble from. Defaults to the shape
+                functions of this section's own mesh.
+
+        Returns:
+            Stiffness matrix, constraint vector and torsion load vector (``k``,
+            ``c_torsion``, ``f_torsion``)
+        """
         if batch is None:
             batch = self.element_batch()
 
@@ -1529,31 +1600,14 @@ class Section:
 
         # the [i, j] entry of every element stiffness matrix belongs at global
         # row node_ids[i] and global column node_ids[j]
-        lagrange = np.arange(n_size)
-        row = np.concatenate(
-            (
-                np.repeat(node_ids, 6, axis=1).ravel(),
-                lagrange,
-                np.full(n_size, n_size),
-            )
-        )
-        col = np.concatenate(
-            (
-                np.tile(node_ids, (1, 6)).ravel(),
-                np.full(n_size, n_size),
-                lagrange,
-            )
-        )
-        data = np.concatenate((k_el.ravel(), c_torsion, c_torsion))
+        row = np.repeat(node_ids, 6, axis=1).ravel()
+        col = np.tile(node_ids, (1, 6)).ravel()
 
-        if progress and task:
-            progress.update(task_id=task, advance=self.num_elements)
-
-        k_lg = coo_matrix(
-            (data, (row, col)), shape=(n_size + 1, n_size + 1), dtype=float
+        k = coo_matrix(
+            (k_el.ravel(), (row, col)), shape=(n_size, n_size), dtype=float
         )
 
-        return csc_matrix(k_lg, dtype=float), f_torsion
+        return csc_matrix(k, dtype=float), c_torsion, f_torsion
 
     def plot_mesh(
         self,

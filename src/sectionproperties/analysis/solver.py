@@ -16,6 +16,7 @@ from rich.progress import (
 from rich.table import Column
 from rich.text import Text
 from scipy.sparse import csc_matrix as _csc_matrix
+from scipy.sparse.csgraph import connected_components
 from scipy.sparse.linalg import cgs, splu, spsolve
 
 if TYPE_CHECKING:
@@ -34,9 +35,19 @@ except ImportError:
     _HAS_PARDISO = False
 
 
+# Whether the pinned warping system is solved with PARDISO when it is installed.
+# The Lagrangian multiplier matrix has a completely dense row and column, which
+# PARDISO's ordering handles far better than SuperLU's. The pinned system that
+# solve_warping_direct() builds does not, and SuperLU is measurably faster on it
+# at every mesh size tested, so PARDISO is not used there by default. Set this to
+# True to use it anyway.
+USE_PARDISO_FOR_WARPING = False
+
+
 def sp_solve_multi(
     k: csc_matrix,
     b: npt.NDArray[np.float64],
+    pardiso: bool | None = None,
 ) -> npt.NDArray[np.float64]:
     """Solves a linear system for several right hand sides at once.
 
@@ -47,11 +58,15 @@ def sp_solve_multi(
     Args:
         k: ``N x N`` matrix of the linear system
         b: ``N x M`` right hand sides of the linear system
+        pardiso: Whether to use PARDISO when it is installed. Defaults to using
+            it whenever it is available.
 
     Returns:
         The ``N x M`` solution of the linear system
     """
-    if _HAS_PARDISO:
+    use_pardiso = _HAS_PARDISO if pardiso is None else (pardiso and _HAS_PARDISO)
+
+    if use_pardiso:
         return np.asarray(sp_solve(A=k, b=b)).reshape(b.shape)
 
     return splu(_csc_matrix(k)).solve(b)
@@ -212,6 +227,69 @@ def solve_direct_lagrange_multi(
         raise RuntimeError(msg)
 
     return u[:n_size, :]
+
+
+def solve_warping_direct(
+    k: csc_matrix,
+    c: npt.NDArray[np.float64],
+    f: npt.NDArray[np.float64],
+) -> npt.NDArray[np.float64]:
+    r"""Solves the warping system :math:`Ku = f` subject to :math:`c \cdot u = 0`.
+
+    The stiffness matrix ``k`` is singular: adding a constant to a warping or
+    shear function leaves the equations unchanged. :func:`solve_direct_lagrange`
+    removes that freedom with a Lagrangian multiplier, which appends a fully
+    dense row and column to an otherwise very sparse matrix. Eliminating that
+    row costs an enormous amount of fill-in during the factorisation.
+
+    This routine instead fixes a single degree of freedom, solves the resulting
+    positive definite system, and then shifts the solution by the constant that
+    satisfies the constraint. The result is the same solution, obtained from a
+    factorisation that is roughly an order of magnitude cheaper.
+
+    Args:
+        k: ``N x N`` stiffness matrix, singular up to a constant
+        c: ``N`` constraint vector, the modulus weighted nodal areas
+        f: ``N x M`` right hand sides of the linear system
+
+    Returns:
+        The ``N x M`` solution of the constrained linear systems
+
+    Raises:
+        RuntimeError: If the mesh consists of more than one connected region, in
+            which case the warping problem has no unique solution
+    """
+    n_size = k.shape[0]
+
+    # the null space of k is the set of functions that are constant on each
+    # connected region of the mesh, so pinning a single degree of freedom only
+    # leaves a non-singular system when the mesh is connected
+    n_regions, _ = connected_components(csgraph=k, directed=False)
+
+    if n_regions > 1:
+        msg = f"The finite element mesh consists of {n_regions} disconnected "
+        msg += "regions, which is invalid for a warping analysis. Please revise your "
+        msg += "geometry to ensure there is connectivity between all regions. See "
+        msg += "https://sectionproperties.rtfd.io/en/stable/user_guide/analysis.html"
+        msg += "#warping-analysis for more information."
+        raise RuntimeError(msg)
+
+    # fix the best conditioned degree of freedom
+    pinned = int(np.argmax(k.diagonal()))
+    free = np.ones(n_size, dtype=bool)
+    free[pinned] = False
+
+    k_free = _csc_matrix(k.tocsr()[free][:, free])
+
+    u = np.zeros((n_size, f.shape[1]))
+    u[free, :] = sp_solve_multi(
+        k=k_free, b=f[free, :], pardiso=USE_PARDISO_FOR_WARPING
+    )
+
+    # restore the constraint by shifting each solution by a constant
+    u -= (c @ u) / c.sum()
+
+    return u
 
 
 class CustomTimeElapsedColumn(ProgressColumn):
