@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -243,25 +244,26 @@ def solve_direct_lagrange_multi(
     return u[:n_size, :]
 
 
-def _pin_dof(
+def _pin_dofs(
     k: csc_matrix,
-    dof: int,
+    dofs: npt.NDArray[np.int_],
 ) -> csc_matrix:
-    """Replaces the equation of a degree of freedom with ``u[dof] = 0``.
+    """Replaces the equations of some degrees of freedom with ``u[dof] = 0``.
 
-    The row and the column of ``dof`` are zeroed and its diagonal entry is set
-    to one. Working on the stored values keeps the sparsity structure of the
-    matrix, which is much cheaper than slicing the row and column away.
+    Their rows and columns are zeroed and their diagonal entries are set to one.
+    Working on the stored values keeps the sparsity structure of the matrix,
+    which is much cheaper than slicing the rows and columns away.
 
     Args:
         k: ``N x N`` matrix in CSC format
-        dof: Index of the degree of freedom to fix
+        dofs: Indices of the degrees of freedom to fix
 
     Returns:
-        The ``N x N`` matrix with the equation of ``dof`` replaced
+        The ``N x N`` matrix with the equations of ``dofs`` replaced
 
     Raises:
-        RuntimeError: If the matrix has no entry on the diagonal of ``dof``
+        RuntimeError: If the matrix has no entry on the diagonal of a fixed
+            degree of freedom
     """
     if not k.has_sorted_indices:
         k.sort_indices()
@@ -270,22 +272,22 @@ def _pin_dof(
         (k.data.copy(), k.indices, k.indptr), shape=k.shape, copy=False
     )
 
-    # the column of dof is one contiguous block of the data array
-    start = int(pinned.indptr[dof])
-    stop = int(pinned.indptr[dof + 1])
-    offset = int(np.searchsorted(pinned.indices[start:stop], dof))
+    # the rows are every entry whose row index is one of the fixed dofs
+    pinned.data[np.isin(pinned.indices, dofs)] = 0.0
 
-    if offset >= stop - start or pinned.indices[start + offset] != dof:
-        msg = "The stiffness matrix has no entry on the diagonal of the degree of "
-        msg += "freedom being fixed, which means the mesh contains an unused node."
-        raise RuntimeError(msg)
+    for dof in dofs:
+        # the column of a dof is one contiguous block of the data array
+        start = int(pinned.indptr[dof])
+        stop = int(pinned.indptr[dof + 1])
+        offset = int(np.searchsorted(pinned.indices[start:stop], dof))
 
-    pinned.data[start:stop] = 0.0
+        if offset >= stop - start or pinned.indices[start + offset] != dof:
+            msg = "The stiffness matrix has no entry on the diagonal of the degree of "
+            msg += "freedom being fixed, which means the mesh contains an unused node."
+            raise RuntimeError(msg)
 
-    # the row of dof is every entry whose row index is dof
-    pinned.data[pinned.indices == dof] = 0.0
-
-    pinned.data[start + offset] = 1.0
+        pinned.data[start:stop] = 0.0
+        pinned.data[start + offset] = 1.0
 
     return pinned
 
@@ -315,30 +317,37 @@ def solve_warping_direct(
 
     Returns:
         The ``N x M`` solution of the constrained linear systems
-
-    Raises:
-        RuntimeError: If the mesh consists of more than one connected region, in
-            which case the warping problem has no unique solution
     """
-    n_size = k.shape[0]
+    k = k.tocsc()
+    diagonal = k.diagonal()
 
     # the null space of k is the set of functions that are constant on each
-    # connected region of the mesh, so pinning a single degree of freedom only
-    # leaves a non-singular system when the mesh is connected
-    n_regions, _ = connected_components(csgraph=k, directed=False)
+    # connected region of the mesh, so one degree of freedom has to be fixed per
+    # region. A warping analysis of a mesh with more than one region is not
+    # meaningful, but the analysis is allowed to run and warn rather than fail.
+    n_regions, region = connected_components(csgraph=k, directed=False)
 
-    if n_regions > 1:
-        msg = f"The finite element mesh consists of {n_regions} disconnected "
+    if n_regions == 1:
+        pinned = np.array([int(np.argmax(diagonal))])
+    else:
+        msg = f"\nThe finite element mesh consists of {n_regions} disconnected "
         msg += "regions, which is invalid for a warping analysis. Please revise your "
-        msg += "geometry to ensure there is connectivity between all regions. See "
-        msg += "https://sectionproperties.rtfd.io/en/stable/user_guide/analysis.html"
-        msg += "#warping-analysis for more information."
-        raise RuntimeError(msg)
+        msg += "geometry to ensure there is connectivity between all regions. Please "
+        msg += "see https://sectionproperties.rtfd.io/en/stable/user_guide/"
+        msg += "analysis.html#warping-analysis for more information."
+        warnings.warn(msg, stacklevel=2)
 
-    # fix the best conditioned degree of freedom by replacing its equation with
-    # u[pinned] = 0, which keeps the sparsity structure of the matrix intact
-    pinned = int(np.argmax(k.diagonal()))
-    k_pinned = _pin_dof(k=k.tocsc(), dof=pinned)
+        # fix the best conditioned degree of freedom of every region
+        pinned = np.array(
+            [
+                int(np.flatnonzero(region == idx)[np.argmax(diagonal[region == idx])])
+                for idx in range(n_regions)
+            ]
+        )
+
+    # replace the equations of the fixed degrees of freedom with u[pinned] = 0,
+    # which keeps the sparsity structure of the matrix intact
+    k_pinned = _pin_dofs(k=k, dofs=pinned)
 
     rhs = f.copy()
     rhs[pinned, :] = 0.0

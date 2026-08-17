@@ -46,7 +46,9 @@ def build_section(composite: bool) -> Section:
     """Builds a small meshed section, optionally with two materials."""
     if composite:
         bottom = rectangular_section(d=50, b=100, material=STEEL)
-        top = rectangular_section(d=100, b=100, material=TIMBER).shift_section(y_offset=50)
+        top = rectangular_section(d=100, b=100, material=TIMBER).shift_section(
+            y_offset=50
+        )
         geom = bottom + top
         geom.create_mesh(mesh_sizes=[20.0, 20.0])
     else:
@@ -117,9 +119,14 @@ def test_shear_load_vectors_match(composite: bool) -> None:
     ixx, iyy, ixy = section.get_eic() if section.is_composite() else section.get_ic()
     nu = section.get_nu_eff() if section.is_composite() else 0.0
 
-    f_psi, f_phi = batch.shear_load_vectors(element_batch, elastic_modulus, ixx, iyy, ixy, nu)
+    f_psi, f_phi = batch.shear_load_vectors(
+        element_batch, elastic_modulus, ixx, iyy, ixy, nu
+    )
 
-    expected = [el.shear_load_vectors(ixx=ixx, iyy=iyy, ixy=ixy, nu=nu) for el in section.elements]
+    expected = [
+        el.shear_load_vectors(ixx=ixx, iyy=iyy, ixy=ixy, nu=nu)
+        for el in section.elements
+    ]
     assert_close(f_psi, np.array([item[0] for item in expected]))
     assert_close(f_phi, np.array([item[1] for item in expected]))
 
@@ -222,7 +229,9 @@ def test_element_stress_matches(composite: bool) -> None:
     )
 
     for index, name in enumerate(components):
-        assert_close(getattr(stresses, name), np.array([item[index] for item in expected]))
+        assert_close(
+            getattr(stresses, name), np.array([item[index] for item in expected])
+        )
 
     assert np.allclose(stresses.weights, expected[0][11], rtol=RTOL, atol=0.0)
 
@@ -263,7 +272,9 @@ def test_warping_integrals_and_coefficients_match(composite: bool) -> None:
             material=el.material,
         )
         integrals.append(
-            shifted_el.shear_warping_integrals(ixx=ixx, iyy=iyy, ixy=ixy, omega=omega[el.node_ids])
+            shifted_el.shear_warping_integrals(
+                ixx=ixx, iyy=iyy, ixy=ixy, omega=omega[el.node_ids]
+            )
         )
         kappas.append(
             shifted_el.shear_coefficients(
@@ -278,7 +289,11 @@ def test_warping_integrals_and_coefficients_match(composite: bool) -> None:
         monos.append(shifted_el.monosymmetry_integrals(phi=phi))
 
     assert_sum_close(
-        np.array(batch.shear_warping_integrals(shifted, elastic_modulus, ixx, iyy, ixy, omega)),
+        np.array(
+            batch.shear_warping_integrals(
+                shifted, elastic_modulus, ixx, iyy, ixy, omega
+            )
+        ),
         np.array(integrals),
     )
     assert_sum_close(

@@ -12,7 +12,6 @@ import numpy.typing as npt
 from rich.console import Console
 from rich.table import Table
 
-import sectionproperties.analysis.fea as fea
 import sectionproperties.pre.pre as pre
 
 if TYPE_CHECKING:

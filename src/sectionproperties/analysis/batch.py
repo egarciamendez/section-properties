@@ -23,7 +23,7 @@ Index conventions used throughout:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache
 
 import numpy as np
 import numpy.typing as npt
@@ -31,12 +31,10 @@ import numpy.typing as npt
 from sectionproperties.analysis.fea import gauss_points, h_inv
 
 
-@lru_cache(maxsize=None)
+@cache
 def isoparametric_data(
     n: int,
-) -> tuple[
-    npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]
-]:
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
     """Gauss weights, shape functions and isoparametric derivatives of a ``Tri6``.
 
     These only depend on the integration rule, not on the element geometry, so
@@ -273,9 +271,7 @@ def geometric_properties(
 def torsion_properties(
     batch: ElementBatch,
     elastic_modulus: npt.NDArray[np.float64],
-) -> tuple[
-    npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]
-]:
+) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
     """Calculates the warping stiffness matrix and torsion load vector per element.
 
     Vectorised equivalent of

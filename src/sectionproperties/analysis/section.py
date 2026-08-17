@@ -65,9 +65,7 @@ def lagrange_matrix(
     col = np.concatenate((k_coo.col, np.full(n_size, n_size), lagrange))
     data = np.concatenate((k_coo.data, c, c))
 
-    k_lg = coo_matrix(
-        (data, (row, col)), shape=(n_size + 1, n_size + 1), dtype=float
-    )
+    k_lg = coo_matrix((data, (row, col)), shape=(n_size + 1, n_size + 1), dtype=float)
 
     return csc_matrix(k_lg, dtype=float)
 
@@ -267,9 +265,7 @@ class Section:
         """
         if self._mesh_search_tree is None:
             vertices = self.mesh["vertices"]
-            p_mesh = [
-                Polygon(vertices[tri][0:3]) for tri in self.mesh["triangles"]
-            ]
+            p_mesh = [Polygon(vertices[tri][0:3]) for tri in self.mesh["triangles"]]
             self._mesh_search_tree = STRtree(p_mesh)
 
         return self._mesh_search_tree
@@ -633,9 +629,7 @@ class Section:
                 raise ValueError(msg)
 
             # the cgs method works on the Lagrangian multiplier matrix
-            k_lg = (
-                lagrange_matrix(k=k, c=c_torsion) if solver_type == "cgs" else None
-            )
+            k_lg = lagrange_matrix(k=k, c=c_torsion) if solver_type == "cgs" else None
 
             # ILU decomposition of stiffness matrices
             def ilu_decomp(
@@ -678,7 +672,9 @@ class Section:
             ]:
                 if solver_type == "cgs" and k_lg_precond is not None:
                     return (
-                        solver.solve_cgs_lagrange(k_lg=k_lg, f=f_torsion, m=k_lg_precond),
+                        solver.solve_cgs_lagrange(
+                            k_lg=k_lg, f=f_torsion, m=k_lg_precond
+                        ),
                         solver.solve_cgs_lagrange(k_lg=k_lg, f=f_psi, m=k_lg_precond),
                         solver.solve_cgs_lagrange(k_lg=k_lg, f=f_phi, m=k_lg_precond),
                     )
@@ -1093,9 +1089,7 @@ class Section:
                 raise ValueError(msg)
 
             # the cgs method works on the Lagrangian multiplier matrix
-            k_lg = (
-                lagrange_matrix(k=k, c=c_torsion) if solver_type == "cgs" else None
-            )
+            k_lg = lagrange_matrix(k=k, c=c_torsion) if solver_type == "cgs" else None
 
             # ILU decomposition of stiffness matrices
             def ilu_decomp(
@@ -1473,7 +1467,9 @@ class Section:
                     minlength=self.num_nodes,
                 )
                 averaged = nodal_weights != 0
-                scale = np.reciprocal(nodal_weights, where=averaged, out=np.zeros_like(nodal_weights))
+                scale = np.reciprocal(
+                    nodal_weights, where=averaged, out=np.zeros_like(nodal_weights)
+                )
 
                 for component in components:
                     values = getattr(stresses, component)[in_group] * stresses.weights
@@ -1558,8 +1554,9 @@ class Section:
         warping or shear function leaves the equations unchanged. The constraint
         vector ``c_torsion`` removes that freedom through
         :math:`c \cdot \omega = 0`, which :func:`assemble_torsion` expresses as an
-        extra row and column and :func:`~sectionproperties.analysis.solver.solve_warping_direct`
-        applies directly.
+        extra row and column and
+        :func:`~sectionproperties.analysis.solver.solve_warping_direct` applies
+        directly.
 
         Args:
             batch: Shape function data to assemble from. Defaults to the shape
@@ -1591,9 +1588,7 @@ class Section:
         row = np.repeat(node_ids, 6, axis=1).ravel()
         col = np.tile(node_ids, (1, 6)).ravel()
 
-        k = coo_matrix(
-            (k_el.ravel(), (row, col)), shape=(n_size, n_size), dtype=float
-        )
+        k = coo_matrix((k_el.ravel(), (row, col)), shape=(n_size, n_size), dtype=float)
 
         return csc_matrix(k, dtype=float), c_torsion, f_torsion
 
