@@ -202,48 +202,6 @@ def solve_direct_lagrange(
     return u[:-1]
 
 
-def solve_direct_lagrange_multi(
-    k_lg: csc_matrix,
-    f: npt.NDArray[np.float64],
-) -> npt.NDArray[np.float64]:
-    """Solves several linear systems that share a matrix (Lagrangian multiplier).
-
-    Equivalent to calling :func:`solve_direct_lagrange` once per column of ``f``,
-    but the matrix is only factorised once.
-
-    Args:
-        k_lg: ``(N+1) x (N+1)`` Lagrangian multiplier matrix of the linear system
-        f: ``N x M`` right hand sides of the linear system
-
-    Returns:
-        The ``N x M`` solution of the linear systems
-
-    Raises:
-        RuntimeError: If the Lagrangian multiplier method exceeds a relative tolerance
-            of ``1e-7`` or absolute tolerance related to your machine's floating point
-            precision.
-    """
-    n_size = f.shape[0]
-    rhs = np.zeros((n_size + 1, f.shape[1]))
-    rhs[:n_size, :] = f
-
-    u = sp_solve_multi(k=k_lg, b=rhs)
-
-    # compute error for each right hand side
-    multiplier = np.abs(u[-1, :])
-    rel_error = multiplier / np.max(np.absolute(u), axis=0)
-
-    invalid = (rel_error > 1e-7) & (multiplier > 10.0 * np.finfo(float).eps)
-
-    if invalid.any():
-        msg = "Lagrangian multiplier method error exceeds the prescribed tolerance, "
-        msg += "consider refining your mesh. If this error is unexpected raise an "
-        msg += "issue at https://github.com/robbievanleeuwen/section-properties/issues."
-        raise RuntimeError(msg)
-
-    return u[:n_size, :]
-
-
 def _pin_dofs(
     k: csc_matrix,
     dofs: npt.NDArray[np.int_],
