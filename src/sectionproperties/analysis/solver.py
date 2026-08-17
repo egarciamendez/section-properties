@@ -48,6 +48,7 @@ def sp_solve_multi(
     k: csc_matrix,
     b: npt.NDArray[np.float64],
     pardiso: bool | None = None,
+    positive_definite: bool = False,
 ) -> npt.NDArray[np.float64]:
     """Solves a linear system for several right hand sides at once.
 
@@ -60,6 +61,9 @@ def sp_solve_multi(
         b: ``N x M`` right hand sides of the linear system
         pardiso: Whether to use PARDISO when it is installed. Defaults to using
             it whenever it is available.
+        positive_definite: Set to True when the matrix is symmetric positive
+            definite, which lets SuperLU order the matrix symmetrically and skip
+            partial pivoting. Defaults to ``False``.
 
     Returns:
         The ``N x M`` solution of the linear system
@@ -69,7 +73,17 @@ def sp_solve_multi(
     if use_pardiso:
         return np.asarray(sp_solve(A=k, b=b)).reshape(b.shape)
 
-    return splu(_csc_matrix(k)).solve(b)
+    options = (
+        {
+            "permc_spec": "MMD_AT_PLUS_A",
+            "diag_pivot_thresh": 0.0,
+            "options": {"SymmetricMode": True},
+        }
+        if positive_definite
+        else {}
+    )
+
+    return splu(_csc_matrix(k), **options).solve(b)
 
 
 def solve_cgs(
@@ -229,6 +243,53 @@ def solve_direct_lagrange_multi(
     return u[:n_size, :]
 
 
+def _pin_dof(
+    k: csc_matrix,
+    dof: int,
+) -> csc_matrix:
+    """Replaces the equation of a degree of freedom with ``u[dof] = 0``.
+
+    The row and the column of ``dof`` are zeroed and its diagonal entry is set
+    to one. Working on the stored values keeps the sparsity structure of the
+    matrix, which is much cheaper than slicing the row and column away.
+
+    Args:
+        k: ``N x N`` matrix in CSC format
+        dof: Index of the degree of freedom to fix
+
+    Returns:
+        The ``N x N`` matrix with the equation of ``dof`` replaced
+
+    Raises:
+        RuntimeError: If the matrix has no entry on the diagonal of ``dof``
+    """
+    if not k.has_sorted_indices:
+        k.sort_indices()
+
+    pinned = _csc_matrix(
+        (k.data.copy(), k.indices, k.indptr), shape=k.shape, copy=False
+    )
+
+    # the column of dof is one contiguous block of the data array
+    start = int(pinned.indptr[dof])
+    stop = int(pinned.indptr[dof + 1])
+    offset = int(np.searchsorted(pinned.indices[start:stop], dof))
+
+    if offset >= stop - start or pinned.indices[start + offset] != dof:
+        msg = "The stiffness matrix has no entry on the diagonal of the degree of "
+        msg += "freedom being fixed, which means the mesh contains an unused node."
+        raise RuntimeError(msg)
+
+    pinned.data[start:stop] = 0.0
+
+    # the row of dof is every entry whose row index is dof
+    pinned.data[pinned.indices == dof] = 0.0
+
+    pinned.data[start + offset] = 1.0
+
+    return pinned
+
+
 def solve_warping_direct(
     k: csc_matrix,
     c: npt.NDArray[np.float64],
@@ -274,16 +335,19 @@ def solve_warping_direct(
         msg += "#warping-analysis for more information."
         raise RuntimeError(msg)
 
-    # fix the best conditioned degree of freedom
+    # fix the best conditioned degree of freedom by replacing its equation with
+    # u[pinned] = 0, which keeps the sparsity structure of the matrix intact
     pinned = int(np.argmax(k.diagonal()))
-    free = np.ones(n_size, dtype=bool)
-    free[pinned] = False
+    k_pinned = _pin_dof(k=k.tocsc(), dof=pinned)
 
-    k_free = _csc_matrix(k.tocsr()[free][:, free])
+    rhs = f.copy()
+    rhs[pinned, :] = 0.0
 
-    u = np.zeros((n_size, f.shape[1]))
-    u[free, :] = sp_solve_multi(
-        k=k_free, b=f[free, :], pardiso=USE_PARDISO_FOR_WARPING
+    u = sp_solve_multi(
+        k=k_pinned,
+        b=rhs,
+        pardiso=USE_PARDISO_FOR_WARPING,
+        positive_definite=True,
     )
 
     # restore the constraint by shifting each solution by a constant

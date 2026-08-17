@@ -139,19 +139,19 @@ class ElementBatch:
 
         return self.b.reshape(self.num_elements, self.num_gauss_points * 2, 6)
 
-    def repeat_weights(
+    def flatten_directions(
         self,
-        weights: npt.NDArray[np.float64],
+        values: npt.NDArray[np.float64],
     ) -> npt.NDArray[np.float64]:
-        """Repeats per-Gauss-point weights over the two global directions.
+        """Flattens a per-Gauss-point, per-direction array over its last two axes.
 
         Args:
-            weights: Weights of size ``[n_el x n_gp]``
+            values: Values of size ``[n_el x n_gp x 2]``
 
         Returns:
-            Weights of size ``[n_el x (n_gp * 2)]``
+            Values of size ``[n_el x (n_gp * 2)]``
         """
-        return np.repeat(weights, 2, axis=1)
+        return values.reshape(self.num_elements, self.num_gauss_points * 2)
 
 
 def build_batch(
@@ -290,17 +290,17 @@ def torsion_properties(
         vectors (``[n_el x 6]``) and element constraint vectors (``[n_el x 6]``)
     """
     w = batch.weights * elastic_modulus[:, None]
-    w2 = batch.repeat_weights(w)
     b2d = batch.strain_matrix_2d()
 
-    k_el = np.matmul((b2d * w2[:, :, None]).transpose(0, 2, 1), b2d)
+    b_weighted = (batch.b * w[:, :, None, None]).reshape(b2d.shape)
+    k_el = np.matmul(b_weighted.transpose(0, 2, 1), b2d)
 
-    load = np.stack((batch.ny, -batch.nx), axis=-1).reshape(w2.shape) * w2
-    f_el = np.matmul(b2d.transpose(0, 2, 1), load[:, :, None])[:, :, 0]
+    load = np.stack((batch.ny, -batch.nx), axis=-1) * w[:, :, None]
+    f_el = np.matmul(b2d.transpose(0, 2, 1), batch.flatten_directions(load)[:, :, None])
 
     c_el = w @ batch.n_shape
 
-    return k_el, f_el, c_el
+    return k_el, f_el[:, :, 0], c_el
 
 
 def _shear_parameters(
@@ -321,8 +321,8 @@ def _shear_parameters(
         ixy: Second moment of area about the centroidal xy-axis
 
     Returns:
-        The (``d1``, ``d2``) and (``h1``, ``h2``) parameters flattened over the
-        Gauss point and direction axes, each of size ``[n_el x (n_gp * 2)]``
+        The (``d1``, ``d2``) and (``h1``, ``h2``) parameters, each of size
+        ``[n_el x n_gp x 2]``
     """
     nx = batch.nx
     ny = batch.ny
@@ -333,9 +333,7 @@ def _shear_parameters(
     d = np.stack((ixx * r - ixy * q, ixy * r + ixx * q), axis=-1)
     h = np.stack((-ixy * r + iyy * q, -iyy * r - ixy * q), axis=-1)
 
-    shape = (batch.num_elements, batch.num_gauss_points * 2)
-
-    return d.reshape(shape), h.reshape(shape)
+    return d, h
 
 
 def shear_load_vectors(
@@ -364,13 +362,15 @@ def shear_load_vectors(
         ``[n_el x 6]``
     """
     w = batch.weights * elastic_modulus[:, None]
-    w2 = batch.repeat_weights(w)
     b2d = batch.strain_matrix_2d()
     d, h = _shear_parameters(batch=batch, ixx=ixx, iyy=iyy, ixy=ixy)
 
+    d_weighted = batch.flatten_directions(d * w[:, :, None])
+    h_weighted = batch.flatten_directions(h * w[:, :, None])
+
     b_transpose = b2d.transpose(0, 2, 1)
-    f_psi = nu / 2 * np.matmul(b_transpose, (d * w2)[:, :, None])[:, :, 0]
-    f_phi = nu / 2 * np.matmul(b_transpose, (h * w2)[:, :, None])[:, :, 0]
+    f_psi = nu / 2 * np.matmul(b_transpose, d_weighted[:, :, None])[:, :, 0]
+    f_phi = nu / 2 * np.matmul(b_transpose, h_weighted[:, :, None])[:, :, 0]
 
     f_psi += 2 * (1 + nu) * ((w * (ixx * batch.nx - ixy * batch.ny)) @ batch.n_shape)
     f_phi += 2 * (1 + nu) * ((w * (iyy * batch.ny - ixy * batch.nx)) @ batch.n_shape)
@@ -453,12 +453,12 @@ def shear_coefficients(
     b2d = batch.strain_matrix_2d()
     d, h = _shear_parameters(batch=batch, ixx=ixx, iyy=iyy, ixy=ixy)
 
-    b_psi_d = np.matmul(b2d, psi_shear[batch.node_ids][:, :, None])[:, :, 0] - nu / 2 * d
-    b_phi_h = np.matmul(b2d, phi_shear[batch.node_ids][:, :, None])[:, :, 0] - nu / 2 * h
-
     shape = (batch.num_elements, batch.num_gauss_points, 2)
-    b_psi_d = b_psi_d.reshape(shape)
-    b_phi_h = b_phi_h.reshape(shape)
+    b_psi = np.matmul(b2d, psi_shear[batch.node_ids][:, :, None]).reshape(shape)
+    b_phi = np.matmul(b2d, phi_shear[batch.node_ids][:, :, None]).reshape(shape)
+
+    b_psi_d = b_psi - nu / 2 * d
+    b_phi_h = b_phi - nu / 2 * h
 
     return (
         float(np.sum(w * np.sum(b_psi_d * b_psi_d, axis=2))),

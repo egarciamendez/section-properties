@@ -287,35 +287,25 @@ class SectionProperties:
             else:
                 self.phi = np.arctan2(self.ixx_c - self.i11_c, self.ixy_c) * 180 / np.pi
 
-            # initialise min, max variables
-            if self.phi is not None:
-                x1, y2 = fea.principal_coordinate(
-                    phi=self.phi,
-                    x=nodes[0][0] - self.cx,
-                    y=nodes[0][1] - self.cy,
-                )
-            else:
+            if self.phi is None:
                 msg = "Arctan error."
                 raise RuntimeError(msg)
 
-            x1max = x1
-            x1min = x1
-            y2max = y2
-            y2min = y2
+            # coordinates of every mesh node with respect to the principal axis
+            phi_rad = self.phi * np.pi / 180
+            cos_phi = np.cos(phi_rad)
+            sin_phi = np.sin(phi_rad)
 
-            # calculate section moduli about the principal axis
-            for pt in nodes[1:]:
-                x = pt[0] - self.cx
-                y = pt[1] - self.cy
+            x = nodes[:, 0] - self.cx
+            y = nodes[:, 1] - self.cy
 
-                # determine the coordinate of the point wrt the principal axis
-                x1, y2 = fea.principal_coordinate(phi=self.phi, x=x, y=y)
+            x1 = x * cos_phi + y * sin_phi
+            y2 = y * cos_phi - x * sin_phi
 
-                # update the mins and maxes where necessary
-                x1max = max(x1max, x1)
-                x1min = min(x1min, x1)
-                y2max = max(y2max, y2)
-                y2min = min(y2min, y2)
+            x1max = float(x1.max())
+            x1min = float(x1.min())
+            y2max = float(y2.max())
+            y2min = float(y2.min())
 
             # evaluate principal section moduli
             self.z11_plus = self.i11_c / abs(y2max)
