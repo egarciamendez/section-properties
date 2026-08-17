@@ -15,7 +15,8 @@ from rich.progress import (
 )
 from rich.table import Column
 from rich.text import Text
-from scipy.sparse.linalg import cgs, spsolve
+from scipy.sparse import csc_matrix as _csc_matrix
+from scipy.sparse.linalg import cgs, splu, spsolve
 
 if TYPE_CHECKING:
     import numpy.typing as npt
@@ -27,8 +28,33 @@ try:
     import pypardiso
 
     sp_solve = pypardiso.spsolve
+    _HAS_PARDISO = True
 except ImportError:
     sp_solve = spsolve
+    _HAS_PARDISO = False
+
+
+def sp_solve_multi(
+    k: csc_matrix,
+    b: npt.NDArray[np.float64],
+) -> npt.NDArray[np.float64]:
+    """Solves a linear system for several right hand sides at once.
+
+    The matrix is factorised once and the factorisation is reused for every
+    right hand side, which is considerably cheaper than solving each system
+    separately.
+
+    Args:
+        k: ``N x N`` matrix of the linear system
+        b: ``N x M`` right hand sides of the linear system
+
+    Returns:
+        The ``N x M`` solution of the linear system
+    """
+    if _HAS_PARDISO:
+        return np.asarray(sp_solve(A=k, b=b)).reshape(b.shape)
+
+    return splu(_csc_matrix(k)).solve(b)
 
 
 def solve_cgs(
@@ -144,6 +170,48 @@ def solve_direct_lagrange(
         raise RuntimeError(msg)
 
     return u[:-1]
+
+
+def solve_direct_lagrange_multi(
+    k_lg: csc_matrix,
+    f: npt.NDArray[np.float64],
+) -> npt.NDArray[np.float64]:
+    """Solves several linear systems that share a matrix (Lagrangian multiplier).
+
+    Equivalent to calling :func:`solve_direct_lagrange` once per column of ``f``,
+    but the matrix is only factorised once.
+
+    Args:
+        k_lg: ``(N+1) x (N+1)`` Lagrangian multiplier matrix of the linear system
+        f: ``N x M`` right hand sides of the linear system
+
+    Returns:
+        The ``N x M`` solution of the linear systems
+
+    Raises:
+        RuntimeError: If the Lagrangian multiplier method exceeds a relative tolerance
+            of ``1e-7`` or absolute tolerance related to your machine's floating point
+            precision.
+    """
+    n_size = f.shape[0]
+    rhs = np.zeros((n_size + 1, f.shape[1]))
+    rhs[:n_size, :] = f
+
+    u = sp_solve_multi(k=k_lg, b=rhs)
+
+    # compute error for each right hand side
+    multiplier = np.abs(u[-1, :])
+    rel_error = multiplier / np.max(np.absolute(u), axis=0)
+
+    invalid = (rel_error > 1e-7) & (multiplier > 10.0 * np.finfo(float).eps)
+
+    if invalid.any():
+        msg = "Lagrangian multiplier method error exceeds the prescribed tolerance, "
+        msg += "consider refining your mesh. If this error is unexpected raise an "
+        msg += "issue at https://github.com/robbievanleeuwen/section-properties/issues."
+        raise RuntimeError(msg)
+
+    return u[:n_size, :]
 
 
 class CustomTimeElapsedColumn(ProgressColumn):

@@ -24,6 +24,7 @@ from scipy.sparse.linalg import LinearOperator, spilu
 from shapely import Point, Polygon
 from shapely.strtree import STRtree
 
+import sectionproperties.analysis.batch as sp_batch
 import sectionproperties.analysis.fea as fea
 import sectionproperties.analysis.plastic_section as sp_plastic
 import sectionproperties.analysis.solver as solver
@@ -110,7 +111,7 @@ class Section:
         self.num_nodes = len(self.mesh_nodes)
 
         # initialise material_groups variable
-        self.material_groups: list[MaterialGroup] = []
+        self._material_groups: list[MaterialGroup] = []
 
         # check that the right number of material properties are specified
         if len(self.materials) != max(self._mesh_attributes) + 1:
@@ -123,55 +124,152 @@ class Section:
         for idx, material in enumerate(self.materials):
             # add the first material to the list
             if idx == 0:
-                self.material_groups.append(
+                self._material_groups.append(
                     MaterialGroup(num_nodes=self.num_nodes, material=material)
                 )
             else:
                 # if the material hasn't been encountered
                 if material not in self.materials[:idx]:
-                    self.material_groups.append(
+                    self._material_groups.append(
                         MaterialGroup(num_nodes=self.num_nodes, material=material)
                     )
 
-        # initialise list holding all element objects
-        self.elements: list[fea.Tri6] = []
+        # map each mesh region onto its material group, matching the element-wise
+        # assignment below
+        self._region_group = np.full(len(self.materials), -1, dtype=int)
 
-        # build the mesh one element at a time
-        for i, node_ids in enumerate(self.mesh_elements):
-            # create a list containing the vertex and mid-node coordinates
-            coords = self.mesh_nodes[node_ids, :].transpose()
-
-            # if materials are specified, get the material
-            if self.materials:
-                # get attribute index of current element
-                att_el: int = self._mesh_attributes[i]
-
-                # fetch the material
-                material = self.materials[att_el]
-            # if there are no materials specified, use a default material
-            else:  # Should not happen but included as failsafe
-                material = pre.DEFAULT_MATERIAL
-
-            # add tri6 elements to the mesh
-            new_element = fea.Tri6(i, coords, node_ids, material)
-            self.elements.append(new_element)
-
-            # add element to relevant MaterialGroup
-            for group in self.material_groups:
+        for region, material in enumerate(self.materials):
+            for group_idx, group in enumerate(self._material_groups):
                 if material is group.material:
-                    group.add_element(element=new_element)
+                    self._region_group[region] = group_idx
                     break
 
-        # create the search tree
-        if self.geometry.mesh is not None:
-            p_mesh = [
-                Polygon(self.geometry.mesh["vertices"][tri][0:3])
-                for tri in self.geometry.mesh["triangles"]
-            ]
-            self.mesh_search_tree = STRtree(p_mesh)
+        # number of finite elements in the mesh
+        self.num_elements = len(self.mesh_elements)
+
+        # element node coordinates, of size [num_elements x 2 x 6], which is the
+        # array form of the ``coords`` attribute of every Tri6 element
+        self.element_coords = self.mesh_nodes[self.mesh_elements].transpose(0, 2, 1)
+        self.element_coords = np.ascontiguousarray(self.element_coords)
+
+        # material properties of every element
+        self.element_elastic_modulus = self._material_property("elastic_modulus")
+        self.element_shear_modulus = self._material_property("shear_modulus")
+        self.element_density = self._material_property("density")
+        self.element_yield_strength = self._material_property("yield_strength")
+
+        # the Tri6 element objects and the mesh search tree are only built when
+        # they are asked for, since the analyses themselves work on the arrays
+        # above
+        self._elements: list[fea.Tri6] | None = None
+        self._mesh_search_tree: STRtree | None = None
 
         # initialise class storing section properties
         self.section_props = post.SectionProperties()
+
+    def _material_property(self, name: str) -> npt.NDArray[np.float64]:
+        """Returns a material property of every element in the mesh.
+
+        Args:
+            name: Name of the :class:`~sectionproperties.pre.pre.Material` attribute
+
+        Returns:
+            The property value for each element, of size ``[num_elements]``
+        """
+        by_region = np.array(
+            [getattr(material, name) for material in self.materials], dtype=float
+        )
+
+        return by_region[self._mesh_attributes]
+
+    def _build_elements(self) -> None:
+        """Creates the ``Tri6`` element objects and fills the material groups."""
+        elements: list[fea.Tri6] = []
+
+        for i, node_ids in enumerate(self.mesh_elements):
+            region: int = self._mesh_attributes[i]
+            material = (
+                self.materials[region] if self.materials else pre.DEFAULT_MATERIAL
+            )
+
+            element = fea.Tri6(i, self.element_coords[i].copy(), node_ids, material)
+            elements.append(element)
+
+            group_idx = self._region_group[region]
+
+            if group_idx >= 0:
+                self._material_groups[group_idx].add_element(element=element)
+
+        self._elements = elements
+
+    @property
+    def elements(self) -> list[fea.Tri6]:
+        """Finite element objects describing the cross-section mesh.
+
+        Returns:
+            List of ``Tri6`` elements
+        """
+        if self._elements is None:
+            self._build_elements()
+
+        return cast("list[fea.Tri6]", self._elements)
+
+    @property
+    def material_groups(self) -> list[MaterialGroup]:
+        """Finite elements and stress results grouped by material.
+
+        Returns:
+            List of ``MaterialGroup`` objects
+        """
+        if self._elements is None:
+            self._build_elements()
+
+        return self._material_groups
+
+    @property
+    def mesh_search_tree(self) -> STRtree:
+        """Search tree enabling efficient lookup of elements in the mesh.
+
+        Returns:
+            STRtree of the mesh triangles
+        """
+        if self._mesh_search_tree is None:
+            vertices = self.mesh["vertices"]
+            p_mesh = [
+                Polygon(vertices[tri][0:3]) for tri in self.mesh["triangles"]
+            ]
+            self._mesh_search_tree = STRtree(p_mesh)
+
+        return self._mesh_search_tree
+
+    def element_batch(
+        self,
+        *,
+        origin: tuple[float, float] = (0.0, 0.0),
+        strain_matrix: bool = True,
+    ) -> sp_batch.ElementBatch:
+        """Evaluates the shape functions of every element in the mesh.
+
+        Args:
+            origin: Point the element coordinates are measured from. The warping
+                analysis works in centroidal coordinates and passes the elastic
+                centroid here. Defaults to ``(0.0, 0.0)``.
+            strain_matrix: Whether the strain matrix is required. Defaults to
+                ``True``.
+
+        Returns:
+            Shape function data for the whole mesh
+        """
+        coords = self.element_coords
+
+        if origin != (0.0, 0.0):
+            coords = coords - np.array(origin, dtype=float)[None, :, None]
+
+        return sp_batch.build_batch(
+            coords=coords,
+            node_ids=self.mesh_elements,
+            strain_matrix=strain_matrix,
+        )
 
     def calculate_geometric_properties(self) -> None:
         r"""Calculates geometric (area) properties.
@@ -224,36 +322,28 @@ class Section:
             if progress:
                 task = progress.add_task(
                     description="[red]Calculating geometric properties",
-                    total=len(self.elements),
+                    total=self.num_elements,
                 )
             else:
                 task = None
 
-            # calculate global geometric properties
-            for el in self.elements:
-                (
-                    area,
-                    qx,
-                    qy,
-                    ixx_g,
-                    iyy_g,
-                    ixy_g,
-                    e,
-                    g,
-                    rho,
-                ) = el.geometric_properties()
-                self.section_props.area += area
-                self.section_props.mass += area * rho
-                self.section_props.ea += area * e
-                self.section_props.ga += area * g
-                self.section_props.qx += qx * e
-                self.section_props.qy += qy * e
-                self.section_props.ixx_g += ixx_g * e
-                self.section_props.iyy_g += iyy_g * e
-                self.section_props.ixy_g += ixy_g * e
+            # calculate global geometric properties for the whole mesh at once
+            batch = self.element_batch(strain_matrix=False)
+            area, qx, qy, ixx_g, iyy_g, ixy_g = sp_batch.geometric_properties(batch)
+            e = self.element_elastic_modulus
 
-                if progress and task is not None:
-                    progress.update(task_id=task, advance=1)
+            self.section_props.area = float(area.sum())
+            self.section_props.mass = float(area @ self.element_density)
+            self.section_props.ea = float(area @ e)
+            self.section_props.ga = float(area @ self.element_shear_modulus)
+            self.section_props.qx = float(qx @ e)
+            self.section_props.qy = float(qy @ e)
+            self.section_props.ixx_g = float(ixx_g @ e)
+            self.section_props.iyy_g = float(iyy_g @ e)
+            self.section_props.ixy_g = float(ixy_g @ e)
+
+            if progress and task is not None:
+                progress.update(task_id=task, advance=self.num_elements)
 
             self.section_props.nu_eff = (
                 self.section_props.ea / (2 * self.section_props.ga) - 1
@@ -303,37 +393,39 @@ class Section:
                 msg = "Section properties failed to save."
                 raise RuntimeError(msg)
 
-            # loop through each material group
-            for group in self.material_groups:
-                em = group.material.elastic_modulus
-                fy = group.material.yield_strength
+            # only elements that belong to a material group contribute, mirroring
+            # the group-by-group loop this replaces
+            grouped = self._region_group[self._mesh_attributes] >= 0
 
-                # loop through each element in the material group
-                for el in group.elements:
-                    # loop through each node in the element
-                    for coord in el.coords.transpose():
-                        # calculate coordinates wrt centroidal & principal axes
-                        x = coord[0] - cx
-                        y = coord[1] - cy
-                        x11, y22 = fea.principal_coordinate(phi=phi, x=x, y=y)
+            # node coordinates wrt the centroidal and principal axes, of size
+            # [num_elements x 6]
+            x = self.element_coords[grouped, 0, :] - cx
+            y = self.element_coords[grouped, 1, :] - cy
 
-                        # calculate bending stresses due to unit moments
-                        sig_mxx = em * (
-                            -ixy / (ixx * iyy - ixy**2) * x
-                            + iyy / (ixx * iyy - ixy**2) * y
-                        )
-                        sig_myy = em * (
-                            -ixx / (ixx * iyy - ixy**2) * x
-                            + ixy / (ixx * iyy - ixy**2) * y
-                        )
-                        sig_m11 = em / i11 * y22
-                        sig_m22 = -em / i22 * x11
+            phi_rad = phi * np.pi / 180
+            x11 = x * np.cos(phi_rad) + y * np.sin(phi_rad)
+            y22 = y * np.cos(phi_rad) - x * np.sin(phi_rad)
 
-                        # update yield indexes
-                        yield_index["mxx"] = max(yield_index["mxx"], abs(sig_mxx / fy))
-                        yield_index["myy"] = max(yield_index["myy"], abs(sig_myy / fy))
-                        yield_index["m11"] = max(yield_index["m11"], abs(sig_m11 / fy))
-                        yield_index["m22"] = max(yield_index["m22"], abs(sig_m22 / fy))
+            # elastic modulus over yield strength of the element each node belongs to
+            em_fy = (
+                self.element_elastic_modulus[grouped]
+                / self.element_yield_strength[grouped]
+            )[:, None]
+
+            # bending stresses due to unit moments, divided by the yield strength
+            sig_mxx = em_fy * (
+                -ixy / (ixx * iyy - ixy**2) * x + iyy / (ixx * iyy - ixy**2) * y
+            )
+            sig_myy = em_fy * (
+                -ixx / (ixx * iyy - ixy**2) * x + ixy / (ixx * iyy - ixy**2) * y
+            )
+            sig_m11 = em_fy / i11 * y22
+            sig_m22 = -em_fy / i22 * x11
+
+            yield_index["mxx"] = float(np.abs(sig_mxx).max(initial=0.0))
+            yield_index["myy"] = float(np.abs(sig_myy).max(initial=0.0))
+            yield_index["m11"] = float(np.abs(sig_m11).max(initial=0.0))
+            yield_index["m22"] = float(np.abs(sig_m22).max(initial=0.0))
 
             # calculate yield moments
             self.section_props.my_xx = 1.0 / yield_index["mxx"]
@@ -426,18 +518,13 @@ class Section:
                 msg += "analysis.html#warping-analysis for more information."
                 warnings.warn(msg, stacklevel=1)
 
-        # create a new Section with the origin shifted to the centroid for calculation
-        # of the warping properties such that the Lagrangian multiplier approach can be
-        # utilised
-        warping_section = Section(geometry=self.geometry)
-
-        # shift the coordinates of each element
+        # the warping analysis is carried out in centroidal coordinates so that the
+        # Lagrangian multiplier approach can be utilised
         # N.B. the mesh class attribute remains unshifted!
         cx, cy = self.get_c()
-
-        for el in warping_section.elements:
-            el.coords[0, :] -= cx
-            el.coords[1, :] -= cy
+        batch = self.element_batch(origin=(cx, cy))
+        elastic_modulus = self.element_elastic_modulus
+        flat_node_ids = batch.node_ids.ravel()
 
         # entire warping analysis is contained in following definition
         def warping_analysis(progress: Progress | None = None) -> None:
@@ -447,10 +534,10 @@ class Section:
                 msg += "matrix"
                 task = progress.add_task(
                     description=msg,
-                    total=len(warping_section.elements),
+                    total=self.num_elements,
                 )
-                k_lg, f_torsion = warping_section.assemble_torsion(
-                    progress=progress, task=task
+                k_lg, f_torsion = self.assemble_torsion(
+                    progress=progress, task=task, batch=batch
                 )
 
                 msg = f"[green]:white_check_mark: {self.num_nodes}x{self.num_nodes} "
@@ -458,7 +545,54 @@ class Section:
                 progress.update(task_id=task, description=msg)
                 progress.update(cast("TaskID", 0), advance=1)
             else:
-                k_lg, f_torsion = warping_section.assemble_torsion()
+                k_lg, f_torsion = self.assemble_torsion(batch=batch)
+
+            # section properties the shear function load vectors depend on
+            if self.is_composite():
+                ixx_c, iyy_c, ixy_c = self.get_eic()
+            else:
+                ixx_c, iyy_c, ixy_c = self.get_ic()
+
+            nu_eff = self.get_nu_eff() if self.is_composite() else 0.0
+
+            # assemble shear function load vectors
+            def assemble_shear_load(
+                progress: Progress | None = None,
+                task: TaskID | None = None,
+            ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+                f_psi_el, f_phi_el = sp_batch.shear_load_vectors(
+                    batch=batch,
+                    elastic_modulus=elastic_modulus,
+                    ixx=ixx_c,
+                    iyy=iyy_c,
+                    ixy=ixy_c,
+                    nu=nu_eff,
+                )
+
+                f_psi = np.bincount(
+                    flat_node_ids, weights=f_psi_el.ravel(), minlength=self.num_nodes
+                )
+                f_phi = np.bincount(
+                    flat_node_ids, weights=f_phi_el.ravel(), minlength=self.num_nodes
+                )
+
+                if progress and task:
+                    progress.update(task_id=task, advance=self.num_elements)
+
+                return f_psi, f_phi
+
+            if progress:
+                task = progress.add_task(
+                    description="[red]Assembling shear function vectors",
+                    total=self.num_elements,
+                )
+                f_psi, f_phi = assemble_shear_load(progress=progress, task=task)
+
+                msg = "[green]:white_check_mark: Shear function vectors assembled"
+                progress.update(task, description=msg)
+                progress.update(cast("TaskID", 0), advance=1)
+            else:
+                f_psi, f_phi = assemble_shear_load()
 
             # ILU decomposition of stiffness matrices
             def ilu_decomp(
@@ -491,179 +625,77 @@ class Section:
             else:
                 k_lg_precond = None
 
-            # solve for warping function
-            def solve_warping() -> npt.NDArray[np.float64]:
+            # solve for the warping function and the two shear functions - all three
+            # systems share the same stiffness matrix, so the direct solver factorises
+            # it once and reuses that factorisation
+            def solve_functions() -> tuple[
+                npt.NDArray[np.float64],
+                npt.NDArray[np.float64],
+                npt.NDArray[np.float64],
+            ]:
                 if solver_type == "cgs" and k_lg_precond:
-                    omega = solver.solve_cgs_lagrange(
-                        k_lg=k_lg, f=f_torsion, m=k_lg_precond
+                    return (
+                        solver.solve_cgs_lagrange(k_lg=k_lg, f=f_torsion, m=k_lg_precond),
+                        solver.solve_cgs_lagrange(k_lg=k_lg, f=f_psi, m=k_lg_precond),
+                        solver.solve_cgs_lagrange(k_lg=k_lg, f=f_phi, m=k_lg_precond),
                     )
-                elif solver_type == "direct":
-                    omega = solver.solve_direct_lagrange(k_lg=k_lg, f=f_torsion)
-                else:
-                    msg = "solver_type must be 'cgs' or 'direct'."
-                    raise ValueError(msg)
 
-                return omega
+                if solver_type == "direct":
+                    solution = solver.solve_direct_lagrange_multi(
+                        k_lg=k_lg,
+                        f=np.column_stack((f_torsion, f_psi, f_phi)),
+                    )
+                    return solution[:, 0], solution[:, 1], solution[:, 2]
+
+                msg = "solver_type must be 'cgs' or 'direct'."
+                raise ValueError(msg)
 
             if progress:
-                msg = f"[red]Solving warping function ({solver_type})"
+                msg = f"[red]Solving warping and shear functions ({solver_type})"
                 task = progress.add_task(description=msg, total=1)
 
-                omega = solve_warping()
+                omega, psi_shear, phi_shear = solve_functions()
 
                 progress.update(task, advance=1)
 
-                msg = "[green]:white_check_mark: Warping function solved "
+                msg = "[green]:white_check_mark: Warping and shear functions solved "
                 msg += f"({solver_type})"
                 progress.update(task, description=msg)
-                progress.update(cast("TaskID", 0), advance=1)
+                progress.update(cast("TaskID", 0), advance=2)
             else:
-                omega = solve_warping()
+                omega, psi_shear, phi_shear = solve_functions()
 
-            # save the warping function
+            # save the warping and shear functions
             self.section_props.omega = omega
-
-            # determine the torsion constant
-            if self.is_composite():
-                ixx_c, iyy_c, ixy_c = self.get_eic()
-            else:
-                ixx_c, iyy_c, ixy_c = self.get_ic()
-
-            self.section_props.j = ixx_c + iyy_c - omega.dot(f_torsion)
-
-            # assemble shear function load vectors
-            nu_eff = self.get_nu_eff() if self.is_composite() else 0.0
-
-            def assemble_shear_load(
-                progress: Progress | None = None,
-                task: TaskID | None = None,
-            ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-                f_psi = np.zeros(self.num_nodes)
-                f_phi = np.zeros(self.num_nodes)
-
-                for el in warping_section.elements:
-                    f_psi_el, f_phi_el = el.shear_load_vectors(
-                        ixx=ixx_c,
-                        iyy=iyy_c,
-                        ixy=ixy_c,
-                        nu=nu_eff,
-                    )
-                    f_psi[el.node_ids] += f_psi_el
-                    f_phi[el.node_ids] += f_phi_el
-
-                    if progress and task:
-                        progress.update(task_id=task, advance=1)
-
-                return f_psi, f_phi
-
-            if progress:
-                task = progress.add_task(
-                    description="[red]Assembling shear function vectors",
-                    total=len(warping_section.elements),
-                )
-                f_psi, f_phi = assemble_shear_load(progress=progress, task=task)
-
-                msg = "[green]:white_check_mark: Shear function vectors assembled"
-                progress.update(task, description=msg)
-                progress.update(cast("TaskID", 0), advance=1)
-            else:
-                f_psi, f_phi = assemble_shear_load()
-
-            # solve for shear functions psi and phi
-            def solve_shear_functions(
-                progress: Progress | None = None,
-                task: TaskID | None = None,
-            ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-                if solver_type == "cgs" and k_lg_precond:
-                    psi_shear = solver.solve_cgs_lagrange(
-                        k_lg=k_lg, f=f_psi, m=k_lg_precond
-                    )
-
-                    if progress and task:
-                        progress.update(task_id=task, advance=1)
-
-                    phi_shear = solver.solve_cgs_lagrange(
-                        k_lg=k_lg, f=f_phi, m=k_lg_precond
-                    )
-
-                    if progress and task:
-                        progress.update(task_id=task, advance=1)
-                else:
-                    psi_shear = solver.solve_direct_lagrange(k_lg=k_lg, f=f_psi)
-
-                    if progress and task:
-                        progress.update(task_id=task, advance=1)
-
-                    phi_shear = solver.solve_direct_lagrange(k_lg=k_lg, f=f_phi)
-
-                    if progress and task:
-                        progress.update(task_id=task, advance=1)
-
-                return psi_shear, phi_shear
-
-            if progress:
-                task = progress.add_task(
-                    description=f"[red]Solving shear functions ({solver_type})",
-                    total=2,
-                )
-                psi_shear, phi_shear = solve_shear_functions(
-                    progress=progress, task=task
-                )
-
-                msg = "[green]:white_check_mark: Shear functions solved "
-                msg += f"({solver_type})"
-                progress.update(task, description=msg)
-                progress.update(cast("TaskID", 0), advance=1)
-            else:
-                psi_shear, phi_shear = solve_shear_functions()
-
-            # save the shear functions
             self.section_props.psi_shear = psi_shear
             self.section_props.phi_shear = phi_shear
+
+            # determine the torsion constant
+            self.section_props.j = ixx_c + iyy_c - omega.dot(f_torsion)
 
             # assemble shear centre and warping moment integrals
             def assemble_sc_warping_integrals(
                 progress: Progress | None = None,
                 task: TaskID | None = None,
             ) -> tuple[float, float, float, float, float, float]:
-                sc_xint = 0.0
-                sc_yint = 0.0
-                q_omega = 0.0
-                i_omega = 0.0
-                i_xomega = 0.0
-                i_yomega = 0.0
+                integrals = sp_batch.shear_warping_integrals(
+                    batch=batch,
+                    elastic_modulus=elastic_modulus,
+                    ixx=ixx_c,
+                    iyy=iyy_c,
+                    ixy=ixy_c,
+                    omega=omega,
+                )
 
-                for el in warping_section.elements:
-                    (
-                        sc_xint_el,
-                        sc_yint_el,
-                        q_omega_el,
-                        i_omega_el,
-                        i_xomega_el,
-                        i_yomega_el,
-                    ) = el.shear_warping_integrals(
-                        ixx=ixx_c,
-                        iyy=iyy_c,
-                        ixy=ixy_c,
-                        omega=omega[el.node_ids],
-                    )
+                if progress and task:
+                    progress.update(task, advance=self.num_elements)
 
-                    sc_xint += sc_xint_el
-                    sc_yint += sc_yint_el
-                    q_omega += q_omega_el
-                    i_omega += i_omega_el
-                    i_xomega += i_xomega_el
-                    i_yomega += i_yomega_el
-
-                    if progress and task:
-                        progress.update(task, advance=1)
-
-                return sc_xint, sc_yint, q_omega, i_omega, i_xomega, i_yomega
+                return integrals
 
             if progress:
                 task = progress.add_task(
                     description="[red]Assembling shear and warping integrals",
-                    total=len(warping_section.elements),
+                    total=self.num_elements,
                 )
                 (
                     sc_xint,
@@ -719,33 +751,26 @@ class Section:
                 task: TaskID | None = None,
             ) -> tuple[float, float, float]:
                 # assemble shear deformation coefficients
-                kappa_x = 0.0
-                kappa_y = 0.0
-                kappa_xy = 0.0
+                coefficients = sp_batch.shear_coefficients(
+                    batch=batch,
+                    elastic_modulus=elastic_modulus,
+                    ixx=ixx_c,
+                    iyy=iyy_c,
+                    ixy=ixy_c,
+                    psi_shear=psi_shear,
+                    phi_shear=phi_shear,
+                    nu=nu_eff,
+                )
 
-                for el in warping_section.elements:
-                    (kappa_x_el, kappa_y_el, kappa_xy_el) = el.shear_coefficients(
-                        ixx=ixx_c,
-                        iyy=iyy_c,
-                        ixy=ixy_c,
-                        psi_shear=psi_shear[el.node_ids],
-                        phi_shear=phi_shear[el.node_ids],
-                        nu=nu_eff,
-                    )
+                if progress and task:
+                    progress.update(task_id=task, advance=self.num_elements)
 
-                    kappa_x += kappa_x_el
-                    kappa_y += kappa_y_el
-                    kappa_xy += kappa_xy_el
-
-                    if progress and task:
-                        progress.update(task_id=task, advance=1)
-
-                return kappa_x, kappa_y, kappa_xy
+                return coefficients
 
             if progress:
                 task = progress.add_task(
                     description="[red]Assembling shear deformation coefficients",
-                    total=len(warping_section.elements),
+                    total=self.num_elements,
                 )
                 kappa_x, kappa_y, kappa_xy = assemble_shear_deformation(
                     progress=progress, task=task
@@ -791,33 +816,21 @@ class Section:
                 progress: Progress | None = None,
                 task: TaskID | None = None,
             ) -> tuple[float, float, float, float]:
-                int_x = 0.0
-                int_y = 0.0
-                int_11 = 0.0
-                int_22 = 0.0
+                integrals = sp_batch.monosymmetry_integrals(
+                    batch=batch,
+                    elastic_modulus=elastic_modulus,
+                    phi=phi,
+                )
 
-                for el in warping_section.elements:
-                    (
-                        int_x_el,
-                        int_y_el,
-                        int_11_el,
-                        int_22_el,
-                    ) = el.monosymmetry_integrals(phi=phi)
+                if progress and task:
+                    progress.update(task_id=task, advance=self.num_elements)
 
-                    int_x += int_x_el
-                    int_y += int_y_el
-                    int_11 += int_11_el
-                    int_22 += int_22_el
-
-                    if progress and task:
-                        progress.update(task_id=task, advance=1)
-
-                return (int_x, int_y, int_11, int_22)
+                return integrals
 
             if progress:
                 task = progress.add_task(
                     description="[red]Assembling monosymmetry integrals",
-                    total=len(self.elements),
+                    total=self.num_elements,
                 )
                 int_x, int_y, int_11, int_22 = calculate_monosymmetry_integrals(
                     progress=progress, task=task
@@ -930,25 +943,26 @@ class Section:
             if progress:
                 task = progress.add_task(
                     description="[red]Calculating geometric properties",
-                    total=len(self.elements),
+                    total=self.num_elements,
                 )
             else:
                 task = None
 
-            # calculate global geometric properties
-            for el in self.elements:
-                area, qx, qy, ixx_g, iyy_g, ixy_g, e, _, _ = el.geometric_properties()
+            # calculate global geometric properties for the whole mesh at once
+            batch = self.element_batch(strain_matrix=False)
+            area, qx, qy, ixx_g, iyy_g, ixy_g = sp_batch.geometric_properties(batch)
+            e = self.element_elastic_modulus
 
-                self.section_props.area += area
-                self.section_props.ea += area * e
-                self.section_props.qx += qx * e
-                self.section_props.qy += qy * e
-                self.section_props.ixx_g += ixx_g * e
-                self.section_props.iyy_g += iyy_g * e
-                self.section_props.ixy_g += ixy_g * e
+            self.section_props.area = float(area.sum())
+            self.section_props.ea = float(area @ e)
+            self.section_props.qx = float(qx @ e)
+            self.section_props.qy = float(qy @ e)
+            self.section_props.ixx_g = float(ixx_g @ e)
+            self.section_props.iyy_g = float(iyy_g @ e)
+            self.section_props.ixy_g = float(ixy_g @ e)
 
-                if progress and task is not None:
-                    progress.update(task_id=task, advance=1)
+            if progress and task is not None:
+                progress.update(task_id=task, advance=self.num_elements)
 
             # calculate elastic centroid location
             self.section_props.calculate_elastic_centroid()
@@ -1011,16 +1025,9 @@ class Section:
 
         # entire warping analysis is contained in following definition
         def warping_analysis(progress: Progress | None = None) -> None:
-            # create a new Section with the origin shifted to the centroid for
-            # calculation of the warping properties
-            warping_section = Section(geometry=self.geometry)
-
-            # shift the coordinates of each element N.B. the mesh class attribute
-            # remains unshifted
-            cx, cy = self.get_c()
-            for el in warping_section.elements:
-                el.coords[0, :] -= cx
-                el.coords[1, :] -= cy
+            # the warping analysis is carried out in centroidal coordinates
+            # N.B. the mesh class attribute remains unshifted!
+            batch = self.element_batch(origin=self.get_c())
 
             # assemble stiffness matrix and load vector for warping function
             if progress:
@@ -1028,10 +1035,10 @@ class Section:
                 msg += "matrix"
                 task = progress.add_task(
                     description=msg,
-                    total=len(warping_section.elements),
+                    total=self.num_elements,
                 )
-                k_lg, f_torsion = warping_section.assemble_torsion(
-                    progress=progress, task=task
+                k_lg, f_torsion = self.assemble_torsion(
+                    progress=progress, task=task, batch=batch
                 )
 
                 msg = f"[green]:white_check_mark: {self.num_nodes}x{self.num_nodes} "
@@ -1039,7 +1046,7 @@ class Section:
                 progress.update(task_id=task, description=msg)
                 progress.update(cast("TaskID", 0), advance=1)
             else:
-                k_lg, f_torsion = warping_section.assemble_torsion()
+                k_lg, f_torsion = self.assemble_torsion(batch=batch)
 
             # ILU decomposition of stiffness matrices
             def ilu_decomp(
@@ -1484,6 +1491,7 @@ class Section:
         self,
         progress: Progress | None = None,
         task: TaskID | None = None,
+        batch: sp_batch.ElementBatch | None = None,
     ) -> tuple[csc_matrix, npt.NDArray[np.float64]]:
         """Assembles the warping stiffness matrix.
 
@@ -1495,49 +1503,51 @@ class Section:
         Args:
             progress: Rich progress object
             task: Rich task object
+            batch: Shape function data to assemble from. Defaults to the shape
+                functions of this section's own mesh.
 
         Returns:
             Lagrangian multiplier stiffness matrix and torsion load vector (``k_lg``,
             ``f_torsion``)
         """
-        # initialise variables
-        n_size = self.num_nodes  # size of matrix
-        row: list[float] = []  # list holding row indices
-        col: list[float] = []  # list holding column indices
-        data: list[float] = []  # list holding stiffness matrix entries
-        f_torsion = np.zeros(n_size)  # force vector array
-        c_torsion = np.zeros(n_size)  # constraint vector array
+        if batch is None:
+            batch = self.element_batch()
 
-        # loop through all elements in the mesh
-        for el in self.elements:
-            # determine number of nodes in the current element
-            n = len(el.node_ids)
+        # size of the matrix and the element node ids, of size [num_elements x 6]
+        n_size = self.num_nodes
+        node_ids = batch.node_ids
 
-            # calculate the element stiffness matrix and torsion load vector
-            k_el, f_el, c_el = el.torsion_properties()
+        # element stiffness matrices and load vectors for the whole mesh
+        k_el, f_el, c_el = sp_batch.torsion_properties(
+            batch, self.element_elastic_modulus
+        )
 
-            # assemble the torsion load vector
-            f_torsion[el.node_ids] += f_el
-            c_torsion[el.node_ids] += c_el
+        # scatter the element vectors onto the global vectors
+        flat_ids = node_ids.ravel()
+        f_torsion = np.bincount(flat_ids, weights=f_el.ravel(), minlength=n_size)
+        c_torsion = np.bincount(flat_ids, weights=c_el.ravel(), minlength=n_size)
 
-            for node_id in el.node_ids:
-                row.extend([node_id] * n)
-            col.extend(list(el.node_ids) * n)
-            data.extend(k_el.flatten())
+        # the [i, j] entry of every element stiffness matrix belongs at global
+        # row node_ids[i] and global column node_ids[j]
+        lagrange = np.arange(n_size)
+        row = np.concatenate(
+            (
+                np.repeat(node_ids, 6, axis=1).ravel(),
+                lagrange,
+                np.full(n_size, n_size),
+            )
+        )
+        col = np.concatenate(
+            (
+                np.tile(node_ids, (1, 6)).ravel(),
+                np.full(n_size, n_size),
+                lagrange,
+            )
+        )
+        data = np.concatenate((k_el.ravel(), c_torsion, c_torsion))
 
-            if progress and task:
-                progress.update(task_id=task, advance=1)
-
-        # construct Lagrangian multiplier matrix:
-        # column vector
-        row.extend(range(n_size))
-        col.extend([n_size] * n_size)
-        data.extend(c_torsion)
-
-        # row vector
-        row.extend([n_size] * n_size)
-        col.extend(range(n_size))
-        data.extend(c_torsion)
+        if progress and task:
+            progress.update(task_id=task, advance=self.num_elements)
 
         k_lg = coo_matrix(
             (data, (row, col)), shape=(n_size + 1, n_size + 1), dtype=float
