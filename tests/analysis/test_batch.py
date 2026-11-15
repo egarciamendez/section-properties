@@ -132,6 +132,111 @@ def test_shear_load_vectors_match(composite: bool) -> None:
 
 
 @pytest.mark.parametrize("composite", [False, True])
+def test_element_stress_matches(composite: bool) -> None:
+    """Batch element stresses equal the element-wise results."""
+    section = build_section(composite=composite)
+    section.calculate_geometric_properties()
+    section.calculate_warping_properties()
+
+    coords, node_ids, elastic_modulus = element_arrays(section)
+    cx, cy = section.get_c()
+    shifted_coords = coords.copy()
+    shifted_coords[:, 0, :] -= cx
+    shifted_coords[:, 1, :] -= cy
+    shifted = batch.build_batch(coords=shifted_coords, node_ids=node_ids, n_gauss=6)
+
+    if section.is_composite():
+        ea = section.get_ea()
+        ixx, iyy, ixy = section.get_eic()
+        i11, i22 = section.get_eip()
+        j = section.get_ej()
+        nu = section.get_nu_eff()
+    else:
+        ea = section.get_area()
+        ixx, iyy, ixy = section.get_ic()
+        i11, i22 = section.get_ip()
+        j = section.get_j()
+        nu = 0.0
+
+    omega = section.section_props.omega
+    psi_shear = section.section_props.psi_shear
+    phi_shear = section.section_props.phi_shear
+    delta_s = section.section_props.delta_s
+    assert omega is not None
+    assert psi_shear is not None
+    assert phi_shear is not None
+    assert delta_s is not None
+
+    actions = {
+        "n": 1e3,
+        "mxx": 2e6,
+        "myy": 3e6,
+        "m11": 4e6,
+        "m22": 5e6,
+        "mzz": 6e6,
+        "vx": 7e3,
+        "vy": 8e3,
+    }
+    properties = {
+        "ixx": ixx,
+        "iyy": iyy,
+        "ixy": ixy,
+        "i11": i11,
+        "i22": i22,
+        "phi": section.get_phi(),
+        "j": j,
+        "nu": nu,
+        "delta_s": delta_s,
+    }
+
+    stresses = batch.element_stress(
+        batch=shifted,
+        elastic_modulus=elastic_modulus,
+        ea=ea,
+        omega=omega,
+        psi_shear=psi_shear,
+        phi_shear=phi_shear,
+        **actions,
+        **properties,
+    )
+
+    expected = [
+        el.element_stress(
+            ea=ea,
+            cx=cx,
+            cy=cy,
+            omega=omega[el.node_ids],
+            psi_shear=psi_shear[el.node_ids],
+            phi_shear=phi_shear[el.node_ids],
+            **actions,
+            **properties,
+        )
+        for el in section.elements
+    ]
+
+    components = (
+        "sig_zz_n",
+        "sig_zz_mxx",
+        "sig_zz_myy",
+        "sig_zz_m11",
+        "sig_zz_m22",
+        "sig_zx_mzz",
+        "sig_zy_mzz",
+        "sig_zx_vx",
+        "sig_zy_vx",
+        "sig_zx_vy",
+        "sig_zy_vy",
+    )
+
+    for index, name in enumerate(components):
+        assert_close(
+            getattr(stresses, name), np.array([item[index] for item in expected])
+        )
+
+    assert np.allclose(stresses.weights, expected[0][11], rtol=RTOL, atol=0.0)
+
+
+@pytest.mark.parametrize("composite", [False, True])
 def test_warping_integrals_and_coefficients_match(composite: bool) -> None:
     """Batch warping integrals, shear coefficients and monosymmetry integrals match."""
     section = build_section(composite=composite)

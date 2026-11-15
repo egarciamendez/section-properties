@@ -28,7 +28,7 @@ from functools import cache
 import numpy as np
 import numpy.typing as npt
 
-from sectionproperties.analysis.fea import gauss_points
+from sectionproperties.analysis.fea import gauss_points, h_inv
 
 
 @cache
@@ -499,4 +499,170 @@ def monosymmetry_integrals(
         float(np.sum(w * (ny * ny * nx + nx * nx * nx))),
         float(np.sum(w * (nx_11 * nx_11 * ny_22 + ny_22 * ny_22 * ny_22))),
         float(np.sum(w * (ny_22 * ny_22 * nx_11 + nx_11 * nx_11 * nx_11))),
+    )
+
+
+@dataclass(frozen=True)
+class ElementStress:
+    """Nodal stresses of every element resulting from a specified loading.
+
+    Every field holds the stress at the six nodes of each element, of size
+    ``[n_el x 6]``.
+
+    Args:
+        sig_zz_n (numpy.ndarray): Normal stress from the axial force
+        sig_zz_mxx (numpy.ndarray): Normal stress from bending about the xx-axis
+        sig_zz_myy (numpy.ndarray): Normal stress from bending about the yy-axis
+        sig_zz_m11 (numpy.ndarray): Normal stress from bending about the 11-axis
+        sig_zz_m22 (numpy.ndarray): Normal stress from bending about the 22-axis
+        sig_zx_mzz (numpy.ndarray): Shear stress in x from the torsion moment
+        sig_zy_mzz (numpy.ndarray): Shear stress in y from the torsion moment
+        sig_zx_vx (numpy.ndarray): Shear stress in x from the shear force in x
+        sig_zy_vx (numpy.ndarray): Shear stress in y from the shear force in x
+        sig_zx_vy (numpy.ndarray): Shear stress in x from the shear force in y
+        sig_zy_vy (numpy.ndarray): Shear stress in y from the shear force in y
+        weights (numpy.ndarray): Integration weights of the six Gauss points, of
+            size ``[6]``
+    """
+
+    sig_zz_n: npt.NDArray[np.float64]
+    sig_zz_mxx: npt.NDArray[np.float64]
+    sig_zz_myy: npt.NDArray[np.float64]
+    sig_zz_m11: npt.NDArray[np.float64]
+    sig_zz_m22: npt.NDArray[np.float64]
+    sig_zx_mzz: npt.NDArray[np.float64]
+    sig_zy_mzz: npt.NDArray[np.float64]
+    sig_zx_vx: npt.NDArray[np.float64]
+    sig_zy_vx: npt.NDArray[np.float64]
+    sig_zx_vy: npt.NDArray[np.float64]
+    sig_zy_vy: npt.NDArray[np.float64]
+    weights: npt.NDArray[np.float64]
+
+
+def element_stress(
+    batch: ElementBatch,
+    elastic_modulus: npt.NDArray[np.float64],
+    n: float,
+    mxx: float,
+    myy: float,
+    m11: float,
+    m22: float,
+    mzz: float,
+    vx: float,
+    vy: float,
+    ea: float,
+    ixx: float,
+    iyy: float,
+    ixy: float,
+    i11: float,
+    i22: float,
+    phi: float,
+    j: float,
+    nu: float,
+    omega: npt.NDArray[np.float64],
+    psi_shear: npt.NDArray[np.float64],
+    phi_shear: npt.NDArray[np.float64],
+    delta_s: float,
+) -> ElementStress:
+    """Calculates the nodal stresses of every element for a specified loading.
+
+    Vectorised equivalent of
+    :meth:`~sectionproperties.analysis.fea.Tri6.element_stress`. The batch must be
+    built on centroidal coordinates with six Gauss points.
+
+    Args:
+        batch: Shape function data for the mesh, in centroidal coordinates
+        elastic_modulus: Elastic modulus of every element, of size ``[n_el]``
+        n: Axial force
+        mxx: Bending moment about the centroidal xx-axis
+        myy: Bending moment about the centroidal yy-axis
+        m11: Bending moment about the centroidal 11-axis
+        m22: Bending moment about the centroidal 22-axis
+        mzz: Torsion moment about the centroidal zz-axis
+        vx: Shear force acting in the x-direction
+        vy: Shear force acting in the y-direction
+        ea: Modulus weighted area
+        ixx: Second moment of area about the centroidal x-axis
+        iyy: Second moment of area about the centroidal y-axis
+        ixy: Second moment of area about the centroidal xy-axis
+        i11: Second moment of area about the principal 11-axis
+        i22: Second moment of area about the principal 22-axis
+        phi: Principal bending axis angle
+        j: St. Venant torsion constant
+        nu: Effective Poisson's ratio for the cross-section
+        omega: Values of the warping function at every node of the mesh
+        psi_shear: Values of the psi shear function at every node of the mesh
+        phi_shear: Values of the phi shear function at every node of the mesh
+        delta_s: Cross-section shear factor
+
+    Returns:
+        The nodal stresses of every element
+    """
+    n_el = batch.num_elements
+    n_gp = batch.num_gauss_points
+    e_mod = elastic_modulus[:, None]
+
+    nx = batch.nx
+    ny = batch.ny
+
+    phi_rad = phi * np.pi / 180
+    nx_11 = nx * np.cos(phi_rad) + ny * np.sin(phi_rad)
+    ny_22 = ny * np.cos(phi_rad) - nx * np.sin(phi_rad)
+
+    determinant = ixx * iyy - ixy**2
+
+    # the axial stress is constant over the element, so it needs no extrapolation
+    sig_zz_n = np.repeat((n * elastic_modulus / ea)[:, None], 6, axis=1)
+
+    # normal stresses at the Gauss points
+    sig_zz_mxx_gp = e_mod * (
+        -(ixy * mxx) / determinant * nx + (iyy * mxx) / determinant * ny
+    )
+    sig_zz_myy_gp = e_mod * (
+        -(ixx * myy) / determinant * nx + (ixy * myy) / determinant * ny
+    )
+    sig_zz_m11_gp = e_mod * m11 / i11 * ny_22
+    sig_zz_m22_gp = e_mod * -m22 / i22 * nx_11
+
+    # shear stresses at the Gauss points, which stay zero for an action that is not
+    # applied, exactly as the element-wise implementation leaves them
+    shape = (n_el, n_gp, 2)
+    torsion = np.zeros(shape)
+    shear_x = np.zeros(shape)
+    shear_y = np.zeros(shape)
+
+    if mzz != 0 or vx != 0 or vy != 0:
+        b2d = batch.strain_matrix_2d()
+        d, h = _shear_parameters(batch=batch, ixx=ixx, iyy=iyy, ixy=ixy)
+
+        if mzz != 0:
+            b_omega = np.matmul(b2d, omega[batch.node_ids][:, :, None]).reshape(shape)
+            torsion = (
+                e_mod[:, :, None] * mzz / j * (b_omega - np.stack((ny, -nx), axis=-1))
+            )
+
+        if vx != 0:
+            b_psi = np.matmul(b2d, psi_shear[batch.node_ids][:, :, None]).reshape(shape)
+            shear_x = e_mod[:, :, None] * vx / delta_s * (b_psi - nu / 2 * d)
+
+        if vy != 0:
+            b_phi = np.matmul(b2d, phi_shear[batch.node_ids][:, :, None]).reshape(shape)
+            shear_y = e_mod[:, :, None] * vy / delta_s * (b_phi - nu / 2 * h)
+
+    # extrapolate the Gauss point results to the element nodes
+    extrapolate = h_inv.transpose()
+
+    return ElementStress(
+        sig_zz_n=sig_zz_n,
+        sig_zz_mxx=sig_zz_mxx_gp @ extrapolate,
+        sig_zz_myy=sig_zz_myy_gp @ extrapolate,
+        sig_zz_m11=sig_zz_m11_gp @ extrapolate,
+        sig_zz_m22=sig_zz_m22_gp @ extrapolate,
+        sig_zx_mzz=torsion[:, :, 0] @ extrapolate,
+        sig_zy_mzz=torsion[:, :, 1] @ extrapolate,
+        sig_zx_vx=shear_x[:, :, 0] @ extrapolate,
+        sig_zy_vx=shear_x[:, :, 1] @ extrapolate,
+        sig_zx_vy=shear_y[:, :, 0] @ extrapolate,
+        sig_zy_vy=shear_y[:, :, 1] @ extrapolate,
+        weights=gauss_points(n=6)[:, 0],
     )

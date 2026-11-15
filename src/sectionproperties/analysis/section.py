@@ -1366,7 +1366,7 @@ class Section:
             if progress:
                 task = progress.add_task(
                     description="[red]Calculating cross-section stresses",
-                    total=len(self.elements),
+                    total=self.num_elements,
                 )
             else:
                 task = None
@@ -1416,91 +1416,78 @@ class Section:
                 psi_shear = np.zeros(shape=self.num_nodes)
                 phi_shear = np.zeros(shape=self.num_nodes)
 
+            # nodal stresses of every element in the mesh, evaluated in centroidal
+            # coordinates at six Gauss points
+            batch = self.element_batch(origin=(cx, cy), n_gauss=6)
+            stresses = sp_batch.element_stress(
+                batch=batch,
+                elastic_modulus=self.element_elastic_modulus,
+                n=n,
+                mxx=mxx,
+                myy=myy,
+                m11=m11,
+                m22=m22,
+                mzz=mzz,
+                vx=vx,
+                vy=vy,
+                ea=ea,
+                ixx=ixx,
+                iyy=iyy,
+                ixy=ixy,
+                i11=i11,
+                i22=i22,
+                phi=phi,
+                j=j,
+                nu=nu,
+                omega=omega,
+                psi_shear=psi_shear,
+                phi_shear=phi_shear,
+                delta_s=delta_s,
+            )
+
+            components = (
+                "sig_zz_n",
+                "sig_zz_mxx",
+                "sig_zz_myy",
+                "sig_zz_m11",
+                "sig_zz_m22",
+                "sig_zx_mzz",
+                "sig_zy_mzz",
+                "sig_zx_vx",
+                "sig_zy_vx",
+                "sig_zx_vy",
+                "sig_zy_vy",
+            )
+
+            # which material group each element belongs to
+            element_group = self._region_group[self._mesh_attributes]
+
             # loop through all material groups
-            for group in stress_post.material_groups:
-                # allocate nodal weights vector for nodal averaging
-                nodal_weights = np.zeros(self.num_nodes)
+            for group_idx, group in enumerate(stress_post.material_groups):
                 sr = group.stress_result
+                in_group = element_group == group_idx
+                node_ids = self.mesh_elements[in_group].ravel()
 
-                # loop through all elements in the material group
-                for el in group.elements:
-                    # get element omega and psi
-                    omega_el = omega[el.node_ids]
-                    psi_shear_el = psi_shear[el.node_ids]
-                    phi_shear_el = phi_shear[el.node_ids]
+                # nodal averaging weights
+                nodal_weights = np.bincount(
+                    node_ids,
+                    weights=np.tile(stresses.weights, int(in_group.sum())),
+                    minlength=self.num_nodes,
+                )
+                averaged = nodal_weights != 0
+                scale = np.reciprocal(
+                    nodal_weights, where=averaged, out=np.zeros_like(nodal_weights)
+                )
 
-                    (
-                        sig_zz_n_el,
-                        sig_zz_mxx_el,
-                        sig_zz_myy_el,
-                        sig_zz_m11_el,
-                        sig_zz_m22_el,
-                        sig_zx_mzz_el,
-                        sig_zy_mzz_el,
-                        sig_zx_vx_el,
-                        sig_zy_vx_el,
-                        sig_zx_vy_el,
-                        sig_zy_vy_el,
-                        weights,
-                    ) = el.element_stress(
-                        n=n,
-                        mxx=mxx,
-                        myy=myy,
-                        m11=m11,
-                        m22=m22,
-                        mzz=mzz,
-                        vx=vx,
-                        vy=vy,
-                        ea=ea,
-                        cx=cx,
-                        cy=cy,
-                        ixx=ixx,
-                        iyy=iyy,
-                        ixy=ixy,
-                        i11=i11,
-                        i22=i22,
-                        phi=phi,
-                        j=j,
-                        nu=nu,
-                        omega=omega_el,
-                        psi_shear=psi_shear_el,
-                        phi_shear=phi_shear_el,
-                        delta_s=delta_s,
+                for component in components:
+                    values = getattr(stresses, component)[in_group] * stresses.weights
+                    total = np.bincount(
+                        node_ids, weights=values.ravel(), minlength=self.num_nodes
                     )
+                    getattr(sr, component)[:] = total * scale
 
-                    # add stresses to global vectors
-                    sr.sig_zz_n[el.node_ids] += sig_zz_n_el * weights
-                    sr.sig_zz_mxx[el.node_ids] += sig_zz_mxx_el * weights
-                    sr.sig_zz_myy[el.node_ids] += sig_zz_myy_el * weights
-                    sr.sig_zz_m11[el.node_ids] += sig_zz_m11_el * weights
-                    sr.sig_zz_m22[el.node_ids] += sig_zz_m22_el * weights
-                    sr.sig_zx_mzz[el.node_ids] += sig_zx_mzz_el * weights
-                    sr.sig_zy_mzz[el.node_ids] += sig_zy_mzz_el * weights
-                    sr.sig_zx_vx[el.node_ids] += sig_zx_vx_el * weights
-                    sr.sig_zy_vx[el.node_ids] += sig_zy_vx_el * weights
-                    sr.sig_zx_vy[el.node_ids] += sig_zx_vy_el * weights
-                    sr.sig_zy_vy[el.node_ids] += sig_zy_vy_el * weights
-
-                    # add nodal weights
-                    nodal_weights[el.node_ids] += weights
-
-                    if progress and task is not None:
-                        progress.update(task_id=task, advance=1)
-
-                # nodal averaging
-                for i, weight in enumerate(nodal_weights):
-                    if weight != 0:
-                        sr.sig_zz_n[i] *= 1 / weight
-                        sr.sig_zz_mxx[i] *= 1 / weight
-                        sr.sig_zz_myy[i] *= 1 / weight
-                        sr.sig_zz_m11[i] *= 1 / weight
-                        sr.sig_zz_m22[i] *= 1 / weight
-                        sr.sig_zx_mzz[i] *= 1 / weight
-                        sr.sig_zy_mzz[i] *= 1 / weight
-                        sr.sig_zx_vx[i] *= 1 / weight
-                        sr.sig_zy_vx[i] *= 1 / weight
-                        sr.sig_zx_vy[i] *= 1 / weight
-                        sr.sig_zy_vy[i] *= 1 / weight
+                if progress and task is not None:
+                    progress.update(task_id=task, advance=int(in_group.sum()))
 
                 # calculate combined stresses
                 sr.calculate_combined_stresses()
