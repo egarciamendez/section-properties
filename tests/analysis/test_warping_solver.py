@@ -161,7 +161,9 @@ def test_frame_analysis_matches_warping_analysis() -> None:
     frame = i_beam()
     frame.calculate_frame_properties()
 
-    assert frame.get_j() == pytest.approx(section.get_j(), rel=1e-12)
+    # the warping analysis solves three right hand sides together, which only
+    # changes the order of summation
+    assert frame.get_j() == pytest.approx(section.get_j(), rel=1e-9)
 
 
 def test_disjoint_mesh_fixes_one_dof_per_region() -> None:
