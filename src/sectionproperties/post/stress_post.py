@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
+from copy import copy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -30,13 +30,13 @@ class StressPost:
 
     A StressPost object is created when a stress analysis is carried out and is returned
     as an object to allow post-processing of the results. The StressPost object creates
-    a ``deepcopy`` of the :class:`~sectionproperties.analysis.section.MaterialGroup` s
+    a copy of the :class:`~sectionproperties.analysis.section.MaterialGroup` s
     within the cross-section to allow the calculation of stresses for each material.
     Methods for post-processing the calculated stresses are provided.
 
     Attributes:
         section (Section): Cross-section object for stress calculation
-        material_groups (MaterialGroup): A deep copy of the
+        material_groups (MaterialGroup): A copy of the
             :class:`~sectionproperties.analysis.section.Section` ``material_groups``
     """
 
@@ -51,10 +51,17 @@ class StressPost:
         """
         self.section = section
 
-        # make a deep copy of the material groups to the StressPost object such that
-        # stress results can be saved to a new material group when a new stress analysis
-        # is performed
-        self.material_groups: list[MaterialGroup] = deepcopy(section.material_groups)
+        # copy the material groups to the StressPost object such that stress results
+        # can be saved to a new material group when a new stress analysis is performed.
+        # The finite elements themselves are immutable as far as post-processing is
+        # concerned, so the groups share them with the section rather than copying
+        # tens of thousands of element objects.
+        self.material_groups: list[MaterialGroup] = []
+
+        for group in section.material_groups:
+            copied = copy(group)
+            copied.stress_result = StressResult(num_nodes=section.num_nodes)
+            self.material_groups.append(copied)
 
     def plot_stress(
         self,
